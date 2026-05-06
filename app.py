@@ -1,23 +1,8 @@
 import os
 import re
-import fast_flights.core as _ff_core
-from fast_flights.primp import Client as _PrimpClient
-
-# Bypass EU GDPR consent page by pre-setting the SOCS cookie
-_orig_fetch = _ff_core.fetch
-def _fetch_with_consent(params):
-    client = _PrimpClient(impersonate='chrome_126', verify=False)
-    client.set_cookies('https://www.google.com', {
-        'SOCS': 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg'
-    })
-    res = client.get('https://www.google.com/travel/flights', params=params)
-    assert res.status_code == 200
-    return res
-_ff_core.fetch = _fetch_with_consent
-
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from fast_flights import FlightData, Passengers, get_flights
+from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
 
 app = Flask(__name__)
 CORS(app)
@@ -37,17 +22,18 @@ def search():
     if not re.match(r'^[A-Z]{3}$', origin):
         return jsonify({'error': 'Ugyldig avgangskode — bruk 3 bokstaver (eks: OSL)'}), 400
     if not re.match(r'^[A-Z]{3}$', destination):
-        return jsonify({'error': 'Ugyldig destinasjonskode — bruk 3 bokstaver (eks: AMS)'}), 400
+        return jsonify({'error': 'Ugyldig destinasjonskode — bruk 3 bokstaver (eks: FCO)'}), 400
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return jsonify({'error': 'Ugyldig dato — bruk YYYY-MM-DD'}), 400
 
     try:
-        result = get_flights(
+        tfs = create_filter(
             flight_data=[FlightData(date=date, from_airport=origin, to_airport=destination)],
             trip='one-way',
             seat='economy',
             passengers=Passengers(adults=1),
         )
+        result = get_flights_from_filter(tfs, currency='NOK')
 
         flights = [
             {
