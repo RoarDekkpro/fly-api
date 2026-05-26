@@ -121,7 +121,7 @@ _TIME_RE  = re.compile(r'(\d{2}:\d{2})\s*[–—\-]\s*(\d{2}:\d{2})')
 _DUR_RE   = re.compile(r'(\d+)\s*t(?:\s*(\d+)\s*m)?')
 _STOPS_RE = re.compile(r'(\d+)\s*stopp', re.I)
 _CABIN_RE = re.compile(
-    r'(Economy|Premium|Business)\s*(?:\d+\s*igjen\s*)?[•●·]?\s*([\d][\d \s]*)\s*p\b',
+    r'(Business Plus|Business|First|Economy|Premium)\s*(?:\d+\s*igjen\s*)?[•●·]?\s*([\d][\d \s]*)\s*p\b',
     re.I
 )
 
@@ -161,15 +161,16 @@ def _parse_page_text(text):
                     if dur_m and dur_m.group(2) and int(dur_m.group(2)) > 0
                     else (f"{dur_m.group(1)}t" if dur_m else ''))
 
-        eco = prem = biz = None
+        eco = prem = biz = fst = None
         for cm in _CABIN_RE.finditer(block):
-            cab = cm.group(1).lower()
+            cab = cm.group(1).lower().replace(' ', '')
             pts = _pts(cm.group(2))
-            if   cab == 'economy': eco  = pts
-            elif cab == 'premium': prem = pts
-            elif cab == 'business': biz = pts
+            if   cab == 'economy':                    eco  = pts
+            elif cab == 'premium':                    prem = pts
+            elif cab in ('business', 'businessplus'): biz  = pts
+            elif cab == 'first':                      fst  = pts
 
-        if any(_is_standard(p) for p in (eco, prem, biz)):
+        if any(_is_standard(p) for p in (eco, prem, biz, fst)):
             flights.append({
                 'departure':    dep_t,
                 'arrival':      arr_t,
@@ -178,6 +179,7 @@ def _parse_page_text(text):
                 'economy_pts':  eco,
                 'premium_pts':  prem,
                 'business_pts': biz,
+                'first_pts':    fst,
             })
 
     return flights
