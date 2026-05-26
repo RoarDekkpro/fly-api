@@ -2,3 +2,4 @@ flask
 flask-cors
 fast-flights
 gunicorn
+playwright

@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 import fast_flights.core as _ff_core
 from fast_flights.primp import Client as _PrimpClient
 
@@ -28,9 +29,10 @@ app = Flask(__name__)
 CORS(app)
 
 
+# ── GOOGLE FLIGHTS ──────────────────────────────────────────────────────────
+
 def fetch_flights(tfs):
     with _lock:
-        # Forsøk 1: uten SOCS (fungerer for de fleste ruter på US-servere)
         _ff_core.fetch = _fetch_plain
         try:
             result = get_flights_from_filter(tfs, currency='NOK')
@@ -38,8 +40,6 @@ def fetch_flights(tfs):
                 return result
         except Exception:
             pass
-
-        # Forsøk 2: med SOCS-cookie (hjelper for noen ruter)
         _ff_core.fetch = _fetch_socs
         try:
             result = get_flights_from_filter(tfs, currency='NOK')
@@ -47,7 +47,6 @@ def fetch_flights(tfs):
                 return result
         except Exception:
             pass
-
         return None
 
 
@@ -109,6 +108,195 @@ def search():
         if 'No flights found' in msg:
             return jsonify({'no_results': True, 'origin': origin, 'destination': destination, 'date': date})
         return jsonify({'error': f'Søkefeil: {msg[:200]}'}), 500
+
+
+# ── SAS EUROBONUS SCRAPER ────────────────────────────────────────────────────
+
+_SAS_CACHE   = {}
+_SAS_TTL     = 300   # 5 min
+_SAS_LOCK    = threading.Semaphore(1)  # only one Chromium at a time
+
+# Regexes for SAS page text parsing
+_TIME_RE  = re.compile(r'(\d{2}:\d{2})\s*[–—\-]\s*(\d{2}:\d{2})')
+_DUR_RE   = re.compile(r'(\d+)\s*t(?:\s*(\d+)\s*m)?')
+_STOPS_RE = re.compile(r'(\d+)\s*stopp', re.I)
+_CABIN_RE = re.compile(
+    r'(Economy|Premium|Business)\s*(?:\d+\s*igjen\s*)?[•●·]?\s*([\d][\d \s]*)\s*p\b',
+    re.I
+)
+
+
+def _pts(s):
+    try:
+        return int(re.sub(r'[\s ]', '', s))
+    except Exception:
+        return None
+
+def _is_standard(pts):
+    return pts is not None and pts > 0 and pts % 1000 == 0
+
+
+def _parse_page_text(text):
+    """Parse the SAS booking page inner text into structured flight rows."""
+    flights = []
+    matches = list(_TIME_RE.finditer(text))
+    if not matches:
+        return flights
+
+    for i, tm in enumerate(matches):
+        start = tm.start()
+        end   = matches[i + 1].start() if i + 1 < len(matches) else start + 900
+        block = text[start:end]
+
+        dep_t = tm.group(1)
+        arr_t = tm.group(2)
+
+        sm    = _STOPS_RE.search(block)
+        stops = int(sm.group(1)) if sm else 0
+        if re.search(r'direkte', block, re.I):
+            stops = 0
+
+        dur_m    = _DUR_RE.search(block)
+        duration = (f"{dur_m.group(1)}t {dur_m.group(2)}m"
+                    if dur_m and dur_m.group(2) and int(dur_m.group(2)) > 0
+                    else (f"{dur_m.group(1)}t" if dur_m else ''))
+
+        eco = prem = biz = None
+        for cm in _CABIN_RE.finditer(block):
+            cab = cm.group(1).lower()
+            pts = _pts(cm.group(2))
+            if   cab == 'economy': eco  = pts
+            elif cab == 'premium': prem = pts
+            elif cab == 'business': biz = pts
+
+        if any(_is_standard(p) for p in (eco, prem, biz)):
+            flights.append({
+                'departure':    dep_t,
+                'arrival':      arr_t,
+                'duration':     duration,
+                'stops':        stops,
+                'economy_pts':  eco,
+                'premium_pts':  prem,
+                'business_pts': biz,
+            })
+
+    return flights
+
+
+def _scrape_sas(origin, dest, date_str):
+    from playwright.sync_api import sync_playwright
+
+    date_sas = date_str.replace('-', '')
+    url = (f'https://www.sas.no/book/flights/'
+           f'?search=OW_{origin}-{dest}-{date_sas}_a1c0i0y0'
+           f'&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all')
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                '--single-process', '--no-zygote', '--disable-setuid-sandbox',
+                '--disable-extensions',
+            ]
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+            locale='nb-NO',
+            timezone_id='Europe/Oslo',
+            viewport={'width': 1280, 'height': 900},
+        )
+        page = ctx.new_page()
+
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+
+            # Dismiss cookie consent if present
+            for selector in [
+                'button:has-text("Godta alle")',
+                'button:has-text("Aksepter alle")',
+                'button:has-text("Accept all")',
+                '[id*="onetrust"] button.accept',
+            ]:
+                try:
+                    page.click(selector, timeout=4000)
+                    page.wait_for_timeout(1000)
+                    break
+                except Exception:
+                    pass
+
+            # Wait for flight results to appear
+            try:
+                page.wait_for_selector(
+                    '[class*="OfferList"], [class*="offer-list"], '
+                    '[class*="FlightList"], [class*="flight-list"]',
+                    timeout=30000
+                )
+            except Exception:
+                page.wait_for_timeout(12000)
+
+            text = page.inner_text('body')
+
+        finally:
+            browser.close()
+
+    return _parse_page_text(text)
+
+
+def get_sas_bonus(origin, dest, date):
+    key = f'{origin}|{dest}|{date}'
+    if key in _SAS_CACHE:
+        val, ts = _SAS_CACHE[key]
+        if time.time() - ts < _SAS_TTL:
+            return val, None
+
+    acquired = _SAS_LOCK.acquire(blocking=True, timeout=90)
+    if not acquired:
+        return [], 'Busy — try again shortly'
+    try:
+        result = _scrape_sas(origin, dest, date)
+        err    = None
+    except Exception as e:
+        result = []
+        err    = str(e)[:200]
+    finally:
+        _SAS_LOCK.release()
+
+    _SAS_CACHE[key] = (result, time.time())
+    return result, err
+
+
+@app.route('/sas-bonus')
+def sas_bonus():
+    origin = request.args.get('origin', '').upper().strip()
+    dest   = request.args.get('destination', '').upper().strip()
+    date   = request.args.get('date', '').strip()
+
+    if not re.match(r'^[A-Z]{3}$', origin):
+        return jsonify({'error': 'Invalid origin'}), 400
+    if not re.match(r'^[A-Z]{3}$', dest):
+        return jsonify({'error': 'Invalid destination'}), 400
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'error': 'Invalid date'}), 400
+
+    date_sas = date.replace('-', '')
+    sas_url  = (f'https://www.sas.no/book/flights/'
+                f'?search=OW_{origin}-{dest}-{date_sas}_a1c0i0y0'
+                f'&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all')
+
+    flights, err = get_sas_bonus(origin, dest, date)
+    return jsonify({
+        'flights':     flights,
+        'sas_url':     sas_url,
+        'origin':      origin,
+        'destination': dest,
+        'date':        date,
+        'error':       err,
+    })
 
 
 if __name__ == '__main__':
