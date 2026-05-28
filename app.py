@@ -121,7 +121,7 @@ _TIME_RE  = re.compile(r'(\d{2}:\d{2})\s*[–—\-]\s*(\d{2}:\d{2})')
 _DUR_RE   = re.compile(r'(\d+)\s*t(?:\s*(\d+)\s*m)?')
 _STOPS_RE = re.compile(r'(\d+)\s*stopp', re.I)
 _CABIN_RE = re.compile(
-    r'(Business Plus|Business|First|Economy|Premium)\s*(?:\d+\s*igjen\s*)?[•●·]?\s*([\d][\d \s]*)\s*p\b',
+    r'(Business Plus|Business|First|Economy|Premium)\s*(?:\d+\s*igjen\s*)?[•●·]?\s*([\d][\d \s]*)\s*(?:p\b|poeng)',
     re.I
 )
 
@@ -199,7 +199,9 @@ def _scrape_sas(origin, dest, date_str):
             args=[
                 '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
                 '--single-process', '--no-zygote', '--disable-setuid-sandbox',
-                '--disable-extensions',
+                '--disable-extensions', '--disable-background-networking',
+                '--disable-default-apps', '--mute-audio', '--no-first-run',
+                '--disable-hang-monitor', '--disable-sync',
             ]
         )
         ctx = browser.new_context(
@@ -213,6 +215,10 @@ def _scrape_sas(origin, dest, date_str):
             viewport={'width': 1280, 'height': 900},
         )
         page = ctx.new_page()
+
+        # Block images, fonts, media to reduce memory usage on low-RAM servers
+        page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot,mp4,webm,avif}',
+                   lambda route: route.abort())
 
         try:
             page.goto(url, wait_until='domcontentloaded', timeout=60000)
@@ -235,11 +241,14 @@ def _scrape_sas(origin, dest, date_str):
             try:
                 page.wait_for_selector(
                     '[class*="OfferList"], [class*="offer-list"], '
-                    '[class*="FlightList"], [class*="flight-list"]',
+                    '[class*="FlightList"], [class*="flight-list"], '
+                    '[class*="flightCard"], [class*="FlightCard"], '
+                    '[class*="journey"], [class*="Journey"], '
+                    '[class*="result-item"], [class*="ResultItem"]',
                     timeout=30000
                 )
             except Exception:
-                page.wait_for_timeout(12000)
+                page.wait_for_timeout(15000)
 
             text = page.inner_text('body')
 
@@ -299,6 +308,52 @@ def sas_bonus():
         'date':        date,
         'error':       err,
     })
+
+
+@app.route('/sas-debug')
+def sas_debug():
+    origin = request.args.get('origin', 'OSL').upper().strip()
+    dest   = request.args.get('destination', 'CPH').upper().strip()
+    date   = request.args.get('date', '2026-06-01').strip()
+
+    from playwright.sync_api import sync_playwright
+    date_sas = date.replace('-', '')
+    url = (f'https://www.sas.no/book/flights/'
+           f'?search=OW_{origin}-{dest}-{date_sas}_a1c0i0y0'
+           f'&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all')
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu',
+                      '--single-process','--no-zygote','--disable-setuid-sandbox',
+                      '--disable-extensions']
+            )
+            ctx = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                locale='nb-NO', timezone_id='Europe/Oslo',
+                viewport={'width': 1280, 'height': 900},
+            )
+            page = ctx.new_page()
+            page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot,mp4,webm}',
+                       lambda route: route.abort())
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            page.wait_for_timeout(15000)
+            text = page.inner_text('body')
+            browser.close()
+
+        matches_time  = len(_TIME_RE.findall(text))
+        matches_cabin = len(_CABIN_RE.findall(text))
+        return jsonify({
+            'url':           url,
+            'text_length':   len(text),
+            'time_matches':  matches_time,
+            'cabin_matches': matches_cabin,
+            'text_sample':   text[:3000],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)[:500]}), 500
 
 
 if __name__ == '__main__':
