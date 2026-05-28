@@ -2,6 +2,9 @@ import os
 import re
 import threading
 import time
+
+# Ensure Playwright finds browsers in the project directory (persists across Render restarts)
+os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/opt/render/project/.browsers')
 import fast_flights.core as _ff_core
 from fast_flights.primp import Client as _PrimpClient
 
