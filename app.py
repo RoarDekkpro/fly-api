@@ -1,10 +1,8 @@
 import os
 import re
+import subprocess
 import threading
 import time
-
-# Ensure Playwright finds browsers in the project directory (persists across Render restarts)
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/opt/render/project/.browsers')
 import fast_flights.core as _ff_core
 from fast_flights.primp import Client as _PrimpClient
 
@@ -27,6 +25,22 @@ def _fetch_socs(params):
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+
+
+def _ensure_chromium():
+    """Install Playwright Chromium at startup if the binary is missing."""
+    try:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        exe = pw.chromium.executable_path
+        pw.stop()
+        if not os.path.exists(exe):
+            raise FileNotFoundError(exe)
+    except Exception:
+        subprocess.run(['python', '-m', 'playwright', 'install', 'chromium'],
+                       check=False, capture_output=False)
+
+_ensure_chromium()
 
 app = Flask(__name__)
 CORS(app)

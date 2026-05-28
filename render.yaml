@@ -3,8 +3,5 @@ services:
     name: fly-api
     env: python
     plan: free
-    envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/.browsers
-    buildCommand: pip install -r requirements.txt && (python -m playwright install-deps chromium || true) && python -m playwright install chromium
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium --with-deps
     startCommand: gunicorn app:app --timeout 120 --workers 1
