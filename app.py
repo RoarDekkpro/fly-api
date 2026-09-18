@@ -477,6 +477,39 @@ def sas_debug():
         return jsonify({'error': str(e)[:500]}), 500
 
 
+@app.route('/route-debug')
+def route_debug():
+    """Temporary: _search_leg() swallows exceptions silently, so /route gives
+    no signal when Google Flights fetches fail outright. This bypasses that
+    to show the real status/error per fetch mode."""
+    origin = request.args.get('origin', 'SVG').upper().strip()
+    dest   = request.args.get('destination', 'FCO').upper().strip()
+    date   = request.args.get('date', '2026-09-28').strip()
+
+    tfs = create_filter(
+        flight_data=[FlightData(date=date, from_airport=origin, to_airport=dest)],
+        trip='one-way', seat='economy', passengers=Passengers(adults=1),
+    )
+    params = {'tfs': tfs.as_b64().decode('utf-8'), 'hl': 'en', 'tfu': 'EgQIABABIgA', 'curr': 'NOK'}
+
+    out = {}
+    try:
+        res = _fetch_plain(params)
+        out['plain_status'] = res.status_code
+        out['plain_len']    = len(res.text)
+    except Exception as e:
+        out['plain_error'] = f'{type(e).__name__}: {e}'[:500]
+
+    try:
+        res = _fetch_socs(params)
+        out['socs_status'] = res.status_code
+        out['socs_len']    = len(res.text)
+    except Exception as e:
+        out['socs_error'] = f'{type(e).__name__}: {e}'[:500]
+
+    return jsonify(out)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
