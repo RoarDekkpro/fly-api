@@ -3,12 +3,12 @@ import re
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-import fast_flights.core as _ff_core
+from fast_flights.core import parse_response as _parse_ff_response
 from fast_flights.primp import Client as _PrimpClient
 
 _SOCS = 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg'
-_lock = threading.Lock()
 
 def _fetch_plain(params):
     client = _PrimpClient(impersonate='chrome_126', verify=False)
@@ -25,7 +25,7 @@ def _fetch_socs(params):
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+from fast_flights import FlightData, Passengers, create_filter
 
 
 def _ensure_chromium():
@@ -56,23 +56,20 @@ def _has_usable_flights(result):
     return bool(result and result.flights and any(fl.departure for fl in result.flights))
 
 
-def fetch_flights(tfs):
-    with _lock:
-        _ff_core.fetch = _fetch_plain
+def _fetch_and_parse(params):
+    """Fetch + parse a single Google Flights query, plain first then with the
+    SOCS consent cookie. Each call owns its own primp Client, so — unlike the
+    old approach of monkeypatching fast_flights.core.fetch under a lock — this
+    is safe to run concurrently across threads, which /route needs to stay
+    under the ~30s proxy timeout when fanning out to multiple hubs."""
+    for fetcher in (_fetch_plain, _fetch_socs):
         try:
-            result = get_flights_from_filter(tfs, currency='NOK')
+            result = _parse_ff_response(fetcher(params))
             if _has_usable_flights(result):
                 return result
         except Exception:
             pass
-        _ff_core.fetch = _fetch_socs
-        try:
-            result = get_flights_from_filter(tfs, currency='NOK')
-            if _has_usable_flights(result):
-                return result
-        except Exception:
-            pass
-        return None
+    return None
 
 
 def _parse_price(price_str):
@@ -120,7 +117,7 @@ def _serialize_flights(result, limit=None):
 
 def _search_leg(origin, destination, date):
     """One-way Google Flights search for a single origin/destination/date leg.
-    Returns a fetch_flights() result, or None on no-results/error."""
+    Returns a fast_flights Result, or None on no-results/error."""
     try:
         tfs = create_filter(
             flight_data=[FlightData(date=date, from_airport=origin, to_airport=destination)],
@@ -128,7 +125,8 @@ def _search_leg(origin, destination, date):
             seat='economy',
             passengers=Passengers(adults=1),
         )
-        return fetch_flights(tfs)
+        params = {'tfs': tfs.as_b64().decode('utf-8'), 'hl': 'en', 'tfu': 'EgQIABABIgA', 'curr': 'NOK'}
+        return _fetch_and_parse(params)
     except Exception:
         return None
 
@@ -199,27 +197,39 @@ def route_search():
     except ValueError:
         return jsonify({'error': 'Ugyldig dato — bruk YYYY-MM-DD'}), 400
 
-    direct = _serialize_flights(_search_leg(origin, destination, date), limit=60)
+    candidate_hubs = [h for h in CONNECTION_HUBS if h not in (origin, destination)][:max_hubs]
 
+    # Stage 1: direct + every hub's first leg, all in parallel. Render's proxy
+    # cuts the connection at ~30s regardless of client timeout, and sequential
+    # fetches at 2-6s each blew past that with more than ~2 hubs — this is the
+    # only way to fit a multi-hub fan-out in the budget.
+    with ThreadPoolExecutor(max_workers=max(1, len(candidate_hubs) + 1)) as pool:
+        direct_future = pool.submit(_search_leg, origin, destination, date)
+        leg1_futures  = {hub: pool.submit(_search_leg, origin, hub, date) for hub in candidate_hubs}
+        direct_result = direct_future.result()
+        leg1_results  = {hub: f.result() for hub, f in leg1_futures.items()}
+
+    direct = _serialize_flights(direct_result, limit=60)
+    hubs_with_leg1 = [hub for hub in candidate_hubs if _has_usable_flights(leg1_results[hub])]
+
+    # Stage 2: only for hubs that actually have a usable first leg, fetch both
+    # onward-leg queries (same day / next day) in parallel too.
     connections = []
-    hubs_tried  = 0
-    for hub in CONNECTION_HUBS:
-        if hub == origin or hub == destination:
-            continue
-        if hubs_tried >= max_hubs:
-            break
-        hubs_tried += 1
+    if hubs_with_leg1:
+        with ThreadPoolExecutor(max_workers=max(1, len(hubs_with_leg1) * 2)) as pool:
+            leg2_futures = {}
+            for hub in hubs_with_leg1:
+                leg2_futures[(hub, 'same')] = pool.submit(_search_leg, hub, destination, date)
+                leg2_futures[(hub, 'next')] = pool.submit(_search_leg, hub, destination, next_date)
+            leg2_results = {k: f.result() for k, f in leg2_futures.items()}
 
-        leg1 = _serialize_flights(_search_leg(origin, hub, date), limit=40)
-        if not leg1:
-            continue
-
-        connections.append({
-            'hub':           hub,
-            'leg1':          leg1,
-            'leg2_same_day': _serialize_flights(_search_leg(hub, destination, date), limit=60),
-            'leg2_next_day': _serialize_flights(_search_leg(hub, destination, next_date), limit=60),
-        })
+        for hub in hubs_with_leg1:
+            connections.append({
+                'hub':           hub,
+                'leg1':          _serialize_flights(leg1_results[hub], limit=40),
+                'leg2_same_day': _serialize_flights(leg2_results[(hub, 'same')], limit=60),
+                'leg2_next_day': _serialize_flights(leg2_results[(hub, 'next')], limit=60),
+            })
 
     return jsonify({
         'origin':      origin,
