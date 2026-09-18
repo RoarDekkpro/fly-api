@@ -1,5 +1,6 @@
 flask
 flask-cors
 fast-flights==2.2
+primp==1.2.3
 gunicorn
 playwright
