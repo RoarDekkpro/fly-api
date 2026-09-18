@@ -28,26 +28,36 @@ from flask_cors import CORS
 from fast_flights import FlightData, Passengers, create_filter
 
 
+_chromium_lock  = threading.Lock()
+_chromium_ready = False
+
 def _ensure_chromium():
     """Install Playwright Chromium if the binary is missing — only needed by
-    the SAS EuroBonus scraper, not by the core Google Flights search/route
-    endpoints. Runs in a background thread (see below) rather than blocking
-    startup: there's no persistent disk on this plan, so every fresh deploy
-    re-downloads ~190MB of browser binaries, which repeatedly exceeded the
-    platform's deploy-readiness timeout and crash-looped the whole app when
-    done synchronously at import time."""
-    try:
-        from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
-        exe = pw.chromium.executable_path
-        pw.stop()
-        if not os.path.exists(exe):
-            raise FileNotFoundError(exe)
-    except Exception:
-        subprocess.run(['python', '-m', 'playwright', 'install', 'chromium'],
-                       check=False, capture_output=False)
-
-threading.Thread(target=_ensure_chromium, daemon=True).start()
+    the SAS EuroBonus scraper, never by the core Google Flights search/route
+    endpoints. Called lazily, on first actual use of a SAS endpoint, NOT at
+    app startup: there's no persistent disk on this plan, so every fresh
+    deploy would otherwise re-download ~190MB of browser binaries every
+    time, which — done eagerly, even backgrounded in a thread — repeatedly
+    crash-looped the entire gunicorn process (almost certainly OOM on this
+    plan's memory limit) and took the whole app down, not just the SAS
+    feature that actually needs it."""
+    global _chromium_ready
+    if _chromium_ready:
+        return
+    with _chromium_lock:
+        if _chromium_ready:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            exe = pw.chromium.executable_path
+            pw.stop()
+            if not os.path.exists(exe):
+                raise FileNotFoundError(exe)
+        except Exception:
+            subprocess.run(['python', '-m', 'playwright', 'install', 'chromium'],
+                           check=False, capture_output=False)
+        _chromium_ready = True
 
 app = Flask(__name__)
 CORS(app)
@@ -347,6 +357,8 @@ def _parse_page_text(text):
 def _scrape_sas(origin, dest, date_str):
     from playwright.sync_api import sync_playwright
 
+    _ensure_chromium()
+
     date_sas = date_str.replace('-', '')
     url = (f'https://www.sas.no/book/flights/'
            f'?search=OW_{origin}-{dest}-{date_sas}_a1c0i0y0'
@@ -476,6 +488,7 @@ def sas_debug():
     date   = request.args.get('date', '2026-06-01').strip()
 
     from playwright.sync_api import sync_playwright
+    _ensure_chromium()
     date_sas = date.replace('-', '')
     url = (f'https://www.sas.no/book/flights/'
            f'?search=OW_{origin}-{dest}-{date_sas}_a1c0i0y0'
