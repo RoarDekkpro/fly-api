@@ -147,9 +147,12 @@ def _search_leg(origin, destination, date):
         return None
 
 
-# Major connection hubs checked when fanning out a route search. Kept short —
-# each hub costs up to 3 Google Flights fetches (leg1 + leg2 same/next day).
-CONNECTION_HUBS = ['CPH', 'ARN', 'AMS', 'FRA', 'LHR', 'IST']
+# Major connection hubs checked when fanning out a route search, all fetched
+# in parallel by /route. OSL first — it's the domestic hub for essentially
+# every Norwegian regional airport (SVG, BGO, TRD, etc.), so routes to/from
+# them almost always connect there, not through one of the international
+# hubs below.
+CONNECTION_HUBS = ['OSL', 'CPH', 'ARN', 'AMS', 'FRA', 'LHR', 'IST']
 
 
 @app.route('/health')
