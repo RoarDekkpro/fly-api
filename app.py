@@ -29,7 +29,13 @@ from fast_flights import FlightData, Passengers, create_filter
 
 
 def _ensure_chromium():
-    """Install Playwright Chromium at startup if the binary is missing."""
+    """Install Playwright Chromium if the binary is missing — only needed by
+    the SAS EuroBonus scraper, not by the core Google Flights search/route
+    endpoints. Runs in a background thread (see below) rather than blocking
+    startup: there's no persistent disk on this plan, so every fresh deploy
+    re-downloads ~190MB of browser binaries, which repeatedly exceeded the
+    platform's deploy-readiness timeout and crash-looped the whole app when
+    done synchronously at import time."""
     try:
         from playwright.sync_api import sync_playwright
         pw = sync_playwright().start()
@@ -41,7 +47,7 @@ def _ensure_chromium():
         subprocess.run(['python', '-m', 'playwright', 'install', 'chromium'],
                        check=False, capture_output=False)
 
-_ensure_chromium()
+threading.Thread(target=_ensure_chromium, daemon=True).start()
 
 app = Flask(__name__)
 CORS(app)
