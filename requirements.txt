@@ -1,5 +1,5 @@
 flask
 flask-cors
-fast-flights
+fast-flights==2.2
 gunicorn
 playwright
