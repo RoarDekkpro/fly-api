@@ -3,6 +3,7 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 import fast_flights.core as _ff_core
 from fast_flights.primp import Client as _PrimpClient
 
@@ -48,23 +49,93 @@ CORS(app)
 
 # ── GOOGLE FLIGHTS ──────────────────────────────────────────────────────────
 
+def _has_usable_flights(result):
+    # A non-empty result can still be all price-only "separate tickets" rows
+    # with no departure/arrival — that happens when the consent page wasn't
+    # actually accepted, and is as useless as an empty result.
+    return bool(result and result.flights and any(fl.departure for fl in result.flights))
+
+
 def fetch_flights(tfs):
     with _lock:
         _ff_core.fetch = _fetch_plain
         try:
             result = get_flights_from_filter(tfs, currency='NOK')
-            if result.flights:
+            if _has_usable_flights(result):
                 return result
         except Exception:
             pass
         _ff_core.fetch = _fetch_socs
         try:
             result = get_flights_from_filter(tfs, currency='NOK')
-            if result.flights:
+            if _has_usable_flights(result):
                 return result
         except Exception:
             pass
         return None
+
+
+def _parse_price(price_str):
+    if not price_str:
+        return None
+    digits = re.sub(r'[^\d]', '', price_str)
+    return int(digits) if digits else None
+
+
+def _serialize_flights(result, limit=None):
+    if result is None:
+        return []
+    flights = [
+        {
+            'is_best':            fl.is_best,
+            'name':               fl.name,
+            'departure':          fl.departure,
+            'arrival':            fl.arrival,
+            'arrival_time_ahead': fl.arrival_time_ahead or '',
+            'duration':           fl.duration,
+            'stops':              fl.stops,
+            'delay':              fl.delay,
+            'price':              fl.price,
+        }
+        for fl in result.flights
+        # Google Flights lists some "separate tickets / self-transfer" combos as
+        # price-only summary rows with no schedule — often the cheapest of all,
+        # which would otherwise flood the top of a price-sorted list unusably.
+        if fl.departure and fl.arrival
+    ]
+    seen = set()
+    deduped = []
+    for f in flights:
+        key = (f['name'], f['departure'], f['arrival'], f['price'])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+    flights = deduped
+    if limit is not None:
+        # Cheapest first — price is this app's proxy for seat availability/belegg.
+        flights.sort(key=lambda f: (_parse_price(f['price']) is None, _parse_price(f['price']) or 0))
+        flights = flights[:limit]
+    return flights
+
+
+def _search_leg(origin, destination, date):
+    """One-way Google Flights search for a single origin/destination/date leg.
+    Returns a fetch_flights() result, or None on no-results/error."""
+    try:
+        tfs = create_filter(
+            flight_data=[FlightData(date=date, from_airport=origin, to_airport=destination)],
+            trip='one-way',
+            seat='economy',
+            passengers=Passengers(adults=1),
+        )
+        return fetch_flights(tfs)
+    except Exception:
+        return None
+
+
+# Major connection hubs checked when fanning out a route search. Kept short —
+# each hub costs up to 3 Google Flights fetches (leg1 + leg2 same/next day).
+CONNECTION_HUBS = ['CPH', 'ARN', 'AMS', 'FRA', 'LHR', 'IST']
 
 
 @app.route('/health')
@@ -86,34 +157,13 @@ def search():
         return jsonify({'error': 'Ugyldig dato — bruk YYYY-MM-DD'}), 400
 
     try:
-        tfs = create_filter(
-            flight_data=[FlightData(date=date, from_airport=origin, to_airport=destination)],
-            trip='one-way',
-            seat='economy',
-            passengers=Passengers(adults=1),
-        )
-        result = fetch_flights(tfs)
+        result = _search_leg(origin, destination, date)
 
         if result is None:
             return jsonify({'no_results': True, 'origin': origin, 'destination': destination, 'date': date})
 
-        flights = [
-            {
-                'is_best':            fl.is_best,
-                'name':               fl.name,
-                'departure':          fl.departure,
-                'arrival':            fl.arrival,
-                'arrival_time_ahead': fl.arrival_time_ahead or '',
-                'duration':           fl.duration,
-                'stops':              fl.stops,
-                'delay':              fl.delay,
-                'price':              fl.price,
-            }
-            for fl in result.flights
-        ]
-
         return jsonify({
-            'flights':       flights,
+            'flights':       _serialize_flights(result),
             'current_price': result.current_price or '',
             'origin':        origin,
             'destination':   destination,
@@ -125,6 +175,60 @@ def search():
         if 'No flights found' in msg:
             return jsonify({'no_results': True, 'origin': origin, 'destination': destination, 'date': date})
         return jsonify({'error': f'Søkefeil: {msg[:200]}'}), 500
+
+
+@app.route('/route')
+def route_search():
+    """Fan-out route search: direct A→B, plus A→hub→B connection options via
+    a fixed set of major hubs, so the client can offer alternative legs instead
+    of only Google's single best-guess itinerary."""
+    origin      = request.args.get('origin', '').upper().strip()
+    destination = request.args.get('destination', '').upper().strip()
+    date        = request.args.get('date', '').strip()
+    max_hubs    = min(max(int(request.args.get('max_hubs', 5) or 5), 0), 8)
+
+    if not re.match(r'^[A-Z]{3}$', origin):
+        return jsonify({'error': 'Ugyldig avgangskode — bruk 3 bokstaver (eks: OSL)'}), 400
+    if not re.match(r'^[A-Z]{3}$', destination):
+        return jsonify({'error': 'Ugyldig destinasjonskode — bruk 3 bokstaver (eks: FCO)'}), 400
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'error': 'Ugyldig dato — bruk YYYY-MM-DD'}), 400
+
+    try:
+        next_date = (datetime.strptime(date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Ugyldig dato — bruk YYYY-MM-DD'}), 400
+
+    direct = _serialize_flights(_search_leg(origin, destination, date), limit=60)
+
+    connections = []
+    hubs_tried  = 0
+    for hub in CONNECTION_HUBS:
+        if hub == origin or hub == destination:
+            continue
+        if hubs_tried >= max_hubs:
+            break
+        hubs_tried += 1
+
+        leg1 = _serialize_flights(_search_leg(origin, hub, date), limit=40)
+        if not leg1:
+            continue
+
+        connections.append({
+            'hub':           hub,
+            'leg1':          leg1,
+            'leg2_same_day': _serialize_flights(_search_leg(hub, destination, date), limit=60),
+            'leg2_next_day': _serialize_flights(_search_leg(hub, destination, next_date), limit=60),
+        })
+
+    return jsonify({
+        'origin':      origin,
+        'destination': destination,
+        'date':        date,
+        'next_date':   next_date,
+        'direct':      direct,
+        'connections': connections,
+    })
 
 
 # ── SAS EUROBONUS SCRAPER ────────────────────────────────────────────────────
