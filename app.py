@@ -177,13 +177,19 @@ def search():
 
 @app.route('/route')
 def route_search():
-    """Fan-out route search: direct A→B, plus A→hub→B connection options via
-    a fixed set of major hubs, so the client can offer alternative legs instead
-    of only Google's single best-guess itinerary."""
+    """Fan-out route search: direct A→B, plus each hub's first leg (A→hub),
+    via a fixed set of major hubs — so the client can offer alternative first
+    legs instead of only Google's single best-guess itinerary. Onward (hub→B)
+    options are NOT included here; the client fetches those lazily per hub
+    from /onward only when a dropdown is actually opened. Fetching onward
+    options for every hub on every search (previous design) meant up to ~16
+    sequential-equivalent Google Flights fetches per request, which blew past
+    this Render plan's hard ~30s proxy timeout even after parallelizing —
+    most of that work was wasted since a user only expands 1-2 hubs."""
     origin      = request.args.get('origin', '').upper().strip()
     destination = request.args.get('destination', '').upper().strip()
     date        = request.args.get('date', '').strip()
-    max_hubs    = min(max(int(request.args.get('max_hubs', 5) or 5), 0), 8)
+    max_hubs    = min(max(int(request.args.get('max_hubs', len(CONNECTION_HUBS)) or len(CONNECTION_HUBS)), 0), len(CONNECTION_HUBS))
 
     if not re.match(r'^[A-Z]{3}$', origin):
         return jsonify({'error': 'Ugyldig avgangskode — bruk 3 bokstaver (eks: OSL)'}), 400
@@ -199,10 +205,7 @@ def route_search():
 
     candidate_hubs = [h for h in CONNECTION_HUBS if h not in (origin, destination)][:max_hubs]
 
-    # Stage 1: direct + every hub's first leg, all in parallel. Render's proxy
-    # cuts the connection at ~30s regardless of client timeout, and sequential
-    # fetches at 2-6s each blew past that with more than ~2 hubs — this is the
-    # only way to fit a multi-hub fan-out in the budget.
+    # Direct + every hub's first leg, all in parallel.
     with ThreadPoolExecutor(max_workers=max(1, len(candidate_hubs) + 1)) as pool:
         direct_future = pool.submit(_search_leg, origin, destination, date)
         leg1_futures  = {hub: pool.submit(_search_leg, origin, hub, date) for hub in candidate_hubs}
@@ -210,26 +213,11 @@ def route_search():
         leg1_results  = {hub: f.result() for hub, f in leg1_futures.items()}
 
     direct = _serialize_flights(direct_result, limit=60)
-    hubs_with_leg1 = [hub for hub in candidate_hubs if _has_usable_flights(leg1_results[hub])]
-
-    # Stage 2: only for hubs that actually have a usable first leg, fetch both
-    # onward-leg queries (same day / next day) in parallel too.
-    connections = []
-    if hubs_with_leg1:
-        with ThreadPoolExecutor(max_workers=max(1, len(hubs_with_leg1) * 2)) as pool:
-            leg2_futures = {}
-            for hub in hubs_with_leg1:
-                leg2_futures[(hub, 'same')] = pool.submit(_search_leg, hub, destination, date)
-                leg2_futures[(hub, 'next')] = pool.submit(_search_leg, hub, destination, next_date)
-            leg2_results = {k: f.result() for k, f in leg2_futures.items()}
-
-        for hub in hubs_with_leg1:
-            connections.append({
-                'hub':           hub,
-                'leg1':          _serialize_flights(leg1_results[hub], limit=40),
-                'leg2_same_day': _serialize_flights(leg2_results[(hub, 'same')], limit=60),
-                'leg2_next_day': _serialize_flights(leg2_results[(hub, 'next')], limit=60),
-            })
+    connections = [
+        {'hub': hub, 'leg1': _serialize_flights(leg1_results[hub], limit=40)}
+        for hub in candidate_hubs
+        if _has_usable_flights(leg1_results[hub])
+    ]
 
     return jsonify({
         'origin':      origin,
@@ -238,6 +226,40 @@ def route_search():
         'next_date':   next_date,
         'direct':      direct,
         'connections': connections,
+    })
+
+
+@app.route('/onward')
+def onward_search():
+    """Onward (hub->destination) options for one hub — same day and next day,
+    fetched lazily only when the client expands that hub's dropdown."""
+    hub         = request.args.get('hub', '').upper().strip()
+    destination = request.args.get('destination', '').upper().strip()
+    date        = request.args.get('date', '').strip()
+
+    if not re.match(r'^[A-Z]{3}$', hub):
+        return jsonify({'error': 'Ugyldig hub-kode'}), 400
+    if not re.match(r'^[A-Z]{3}$', destination):
+        return jsonify({'error': 'Ugyldig destinasjonskode'}), 400
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'error': 'Ugyldig dato'}), 400
+
+    try:
+        next_date = (datetime.strptime(date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Ugyldig dato'}), 400
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        same_future = pool.submit(_search_leg, hub, destination, date)
+        next_future = pool.submit(_search_leg, hub, destination, next_date)
+        same_result = same_future.result()
+        next_result = next_future.result()
+
+    return jsonify({
+        'hub':           hub,
+        'destination':   destination,
+        'leg2_same_day': _serialize_flights(same_result, limit=60),
+        'leg2_next_day': _serialize_flights(next_result, limit=60),
     })
 
 
